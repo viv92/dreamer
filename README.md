@@ -1,2 +1,2 @@
-# rich-rl
-implementations of some recent RL algorithms.
+# dreamer
+Experiments on dreamer and dreamer-v2 algorithms.
