@@ -49,10 +49,32 @@ Differences in guhare implementation (from our implementation of dreamerv2_6_10)
         actions = actions[:1]
         rewards = rewards[:1]
         dones = dones[:1]
+
+-----------------------------------------------------------------
+
+Dreamer-v3 changes:
+
+*1. symlog transform applied to reward targets, obsDecoder targets and critic targets. In practice, they are implemented as symexp_twohot distributions, such that logits are in symlog space and outputs are in symexp space. The paper also mentions applying symlog to encoder inputs p(s_t|h_t, o_t) but I'm not sure if they mean to apply symlog on both h_t and o_t or just one of them (skipping this for now). 
+2. new weighing factors (betas) for dynamics losses
+3. free nats for KL values via clipping
+4. The categorical distributions of both prior q and posterior p of the rssm are smoothed by making them a mixture of 1% uniform and 99% output of neural nets. This can be implemented by smoothing the prior and posterior logits.
+*5. The reward and the critic distributions are two-hot categorical and their output values are the expected values of the respective distributions (not samples from the distribution). The suggested number of discrete buckets = 255 but how do we choose the range of values represented by the discrete buckets (it will depend on the environment though symlog can somewhat limit the range) ? Also check how to implement two-hot encoding as it seems weird to implement than one-hot encoding.
+6. Init the weights of output layers of reward model and critic model to zeros.
+7. Rescaling the lambda_return value for actor loss: Actor uses the lambda_return value for both dynamics loss and reinforce loss. Authors suggest to rescale this lambda_return value for both the actor losses by dividing it with a scale = ema(95th percentile - 5th percentile)
+8. Network architecture change: act_fn=SiLU() and added layernorms
+9. Is unimix used only for RSSM or every one-hot dist ?
+10. Calculation of advantage for actor loss should use critic or target_critic for the baseline value ? Some implementations (e.g. R2Dreamer) use critic (not target) even for calculating lambda_return (check what dreamer-v3 paper suggests). The dreamer-v3 paper suggest always using the critic for calculating both the lambda return and the advantage baseline. The target_critic is used only to regularize the critic via the critic loss: - ( log_prob(lambda_return) + log_prob(target_critic_value) )
+
+Some more things that can be tried:
+1. In RSSM sampling, use gumbel-softmax-straight-through instead of just straight-through
+2. Try bigger networks as they improve efficiency in dreamer-v3
+3. Store the states and beliefs obtained during interaction in the replay buffer 
+4. Take note of when to do dist.rsample() versus dist.mode 
+    4.1. During imagination rollout, we use reward_model.mode(), critic_model.mode(), target_critic_model.mode() and df_model.mean() 
+5. Debug tip: visualize dreams using the observation decoder
+6. R2Dreamer implementation calculates the critic_loss for the representation_rollout (used to train the dynamics model) along with the standard imagination rollouts - not sure if dreamer-v3 paper suggests doing this. R2Dreamer implementation also sets the lambda_return for the final imagination step = 0 for critic_loss.
             
 '''
-
-
 
 
 import numpy as np
@@ -68,43 +90,179 @@ import imageio
 
 # torch.autograd.set_detect_anomaly(True)
 
+# --------------------- distribution utils: oneHot and twoHot ------------------ #
+
+def to_f32(x):
+    return x.to(dtype=torch.float32)
+
+
+def to_i32(x):
+    return x.to(dtype=torch.int32)
+
+
+def symlog(x):
+    return torch.sign(x) * torch.log1p(torch.abs(x))
+
+
+def symexp(x):
+    return torch.sign(x) * torch.expm1(torch.abs(x))
+
+
+# overwrite oneHotDist allowing for unimix
+class OneHotDist(tdist.one_hot_categorical.OneHotCategorical):
+    def __init__(self, logits, unimix_ratio=0.0):
+        # (..., K)
+        probs = F.softmax(to_f32(logits), dim=-1)
+        uniform = unimix_ratio / probs.shape[-1]
+        probs = probs * (1.0 - unimix_ratio) + torch.ones_like(probs, dtype=torch.float32) * uniform
+        logits = torch.log(probs)
+        super().__init__(logits=logits)
+
+    @property
+    def mode(self):
+        # (..., K)
+        _mode = F.one_hot(torch.argmax(self.logits, axis=-1), self.logits.shape[-1])
+        return _mode.detach() + self.logits - self.logits.detach()
+
+    def rsample(self, sample_shape=(), temperature=1.0):
+        # (..., K)
+        return F.gumbel_softmax(self.logits, tau=temperature, hard=True, dim=-1)
+
+    def sample(self, **kwargs):
+        raise NotImplementedError
+
+
+class TwoHot:
+    def __init__(self, logits, bins, squash=None, unsquash=None):
+        # (..., N_bins), (N_bins,)
+        self.logits = to_f32(logits)
+        assert self.logits.shape[-1] == len(bins), (self.logits.shape, len(bins))
+
+        self.bins = bins
+        self.probs = F.softmax(self.logits, dim=-1)  # (..., N_bins)
+        self.squash = squash if squash is not None else (lambda x: x)
+        self.unsquash = unsquash if unsquash is not None else (lambda x: x)
+
+    def mode(self):
+        # (..., N_bins), (N_bins,) -> (..., 1)
+        n = self.logits.shape[-1]
+        if n % 2 == 1:
+            m = (n - 1) // 2
+            p1 = self.probs[..., :m]
+            p2 = self.probs[..., m : m + 1]
+            p3 = self.probs[..., m + 1 :]
+            b1 = self.bins[..., :m]
+            b2 = self.bins[..., m : m + 1]
+            b3 = self.bins[..., m + 1 :]
+            wavg = (p2 * b2).sum(dim=-1, keepdim=True) + ((p1 * b1).flip(dims=(-1,)) + (p3 * b3)).sum(
+                dim=-1, keepdim=True
+            )
+            return self.unsquash(wavg)
+        p1 = self.probs[..., : n // 2]
+        p2 = self.probs[..., n // 2 :]
+        b1 = self.bins[..., : n // 2]
+        b2 = self.bins[..., n // 2 :]
+        wavg = ((p1 * b1).flip(dims=(-1,)) + (p2 * b2)).sum(dim=-1, keepdim=True)
+        return self.unsquash(wavg)
+
+    def log_prob(self, target):
+        # (..., 1)
+        assert target.dtype == self.probs.dtype
+        target = target.squeeze(-1)  # (...,)
+        target_squashed = self.squash(target).detach()  # (...,)
+        # below/above: (...,)
+        below = to_i32(self.bins <= target_squashed.unsqueeze(-1)).sum(dim=-1) - 1
+        above = len(self.bins) - to_i32(self.bins > target_squashed.unsqueeze(-1)).sum(dim=-1)
+        below = torch.clamp(below, 0, len(self.bins) - 1)
+        above = torch.clamp(above, 0, len(self.bins) - 1)
+        equal = below == above
+        dist_to_below = torch.where(
+            equal,
+            torch.tensor(1.0, device=target.device, dtype=torch.float32),
+            (self.bins[below] - target_squashed).abs(),
+        )
+        dist_to_above = torch.where(
+            equal,
+            torch.tensor(1.0, device=target.device, dtype=torch.float32),
+            (self.bins[above] - target_squashed).abs(),
+        )
+        total = dist_to_below + dist_to_above
+        weight_below = dist_to_above / total
+        weight_above = dist_to_below / total
+        oh_below = to_f32(F.one_hot(below, num_classes=len(self.bins)))
+        oh_above = to_f32(F.one_hot(above, num_classes=len(self.bins)))
+        # (..., N_bins)
+        mixed_target = oh_below * weight_below.unsqueeze(-1) + oh_above * weight_above.unsqueeze(-1)
+        log_pred = self.logits - torch.logsumexp(self.logits, dim=-1, keepdim=True)  # (..., N_bins)
+        return (mixed_target * log_pred).sum(dim=-1)  # (...)
+
+
+def onehot(mean, unimix_ratio, **kwargs):
+    return OneHotDist(to_f32(mean), unimix_ratio=unimix_ratio)
+
+
+def symexp_twohot(logits, bin_num, **kwargs):
+    if bin_num % 2 == 1:
+        half = torch.linspace(-20, 0, (bin_num - 1) // 2 + 1, dtype=torch.float32, device=logits.device)
+        half = symexp(half)
+        bins = torch.concatenate([half, -half[:-1].flip(dims=(0,))], 0)
+    else:
+        half = torch.linspace(-20, 0, bin_num // 2, dtype=torch.float32, device=logits.device)
+        half = symexp(half)
+        bins = torch.concatenate([half, -half.flip(dims=(0,))], 0)
+    return TwoHot(to_f32(logits), bins)
+
+
+# --------------------- define networks ------------------ #
+
 
 # RSSM used for both Representation model p(s_t | s_t-1, a_t-1, o_t) and Transition model q(s_t | s_t-1, a_t-1)
 class RSSM(nn.Module):
     def __init__(self, in_dim, o_dim, belief_dim, h_dim, out_dim, batch_size, device):
         super().__init__()
-        self.fc_embed = nn.Linear(in_dim, belief_dim) # layer to embed input (s_t, a_t)
+        self.fc1_embed = nn.Linear(in_dim, h_dim) # layer to embed input (s_t, a_t)
+        self.fc2_embed = nn.Linear(h_dim, belief_dim)
+        self.norm_gru = nn.LayerNorm(belief_dim)
 
         # init deterministic recurrent net (shared between p and q models)
         self.gru_cell = nn.GRUCell(belief_dim, belief_dim) # belief h_t = f(h_t-1, s_t-1, a_t-1)
 
         # init stochastic net (separate layers for p and q models)
         self.obs_encoder_fc1 = nn.Linear(o_dim, h_dim)
-        # self.obs_encoder_fc2 = nn.Linear(h_dim, h_dim)
+        self.obs_encoder_fc2 = nn.Linear(h_dim, h_dim)
+        
         self.p_fc1 = nn.Linear(belief_dim + h_dim, h_dim)
-        self.p_fc2_logits = nn.Linear(h_dim, out_dim)
+        self.p_fc2 = nn.Linear(h_dim, h_dim)
+        self.norm_plogit = nn.LayerNorm(h_dim)
+        self.p_fc3_logits = nn.Linear(h_dim, out_dim)
+        
         self.q_fc1 = nn.Linear(belief_dim, h_dim)
-        self.q_fc2_logits = nn.Linear(h_dim, out_dim)
-        self.elu = nn.ELU()
-        self.relu = nn.ReLU()
+        self.q_fc2 = nn.Linear(h_dim, h_dim)
+        self.norm_qlogit = nn.LayerNorm(h_dim)
+        self.q_fc3_logits = nn.Linear(h_dim, out_dim)
+        self.silu = nn.SiLU()
         self.device = device
 
     # forward pass through RSSM
     def forward(self, prev_belief, x, o=None):
         logits_prior, logits_posterior = None, None
 
-        x = self.elu(self.fc_embed(x))
+        x = self.silu(self.fc1_embed(x))
+        x = self.fc2_embed(x)
+        x = self.norm_gru(x)
         belief = self.gru_cell(x, prev_belief)
         
-        h = self.elu(self.q_fc1(belief))
-        logits_prior = self.q_fc2_logits(h)
+        h = self.silu(self.q_fc1(belief))
+        h = self.silu(self.norm_qlogit(self.q_fc2(h)))
+        logits_prior = self.q_fc3_logits(h)
 
         if o is not None:
-            # o = self.relu(self.obs_encoder_fc1(o))
-            o = self.obs_encoder_fc1(o)
+            o = self.silu(self.obs_encoder_fc1(o))
+            o = self.obs_encoder_fc2(o)
             h_o = torch.cat((belief, o), dim=1)
-            h = self.elu(self.p_fc1(h_o))
-            logits_posterior = self.p_fc2_logits(h)
+            h = self.silu(self.p_fc1(h_o))
+            h = self.silu(self.norm_plogit(self.p_fc2(h)))
+            logits_posterior = self.p_fc3_logits(h)
 
         return belief, logits_prior, logits_posterior
 
@@ -117,9 +275,9 @@ class RSSM(nn.Module):
             batch_shape, item_shape = logits.shape[:-1], logits.shape[-1]
 
             logits = logits.reshape(*batch_shape, n_latents, n_classes)
-            dis = tdist.OneHotCategorical(logits=logits)
-            state = dis.sample()
-            state = state + dis.probs - dis.probs.clone().detach() # for straight through gradient
+            dis = OneHotDist(logits=logits, unimix_ratio=0.01)
+            state = dis.rsample() # gumbel-softmax sample is differentiable
+            # state = state + dis.probs - dis.probs.clone().detach() # for straight through gradient
 
             state = state.flatten(start_dim=-2, end_dim=-1)
             state = state.reshape(*batch_shape, item_shape)
@@ -133,16 +291,6 @@ class RSSM(nn.Module):
 
         return belief, state_prior, state_posterior, logits_prior, logits_posterior
 
-
-    # formulates the one_hot_categorical distribution from logits
-    def get_dist(self, logits, detach=False):
-        if detach:
-            logits = logits.detach()
-        logits = logits.flatten(start_dim=0, end_dim=-2)
-        logits = logits.reshape(logits.shape[0], n_latents, n_classes)
-        dis = tdist.Independent(tdist.OneHotCategoricalStraightThrough(logits=logits), 1)
-        return dis
-    
     # function to calculate KL divergence
     def kl(self, logits_left, logits_right):
 
@@ -153,6 +301,7 @@ class RSSM(nn.Module):
 
         logits_left = reshape_logits(logits_left)
         logits_right = reshape_logits(logits_right)
+
         # (..., K), (..., K)
         logprob_left = torch.log_softmax(logits_left, -1)
         logprob_right = torch.log_softmax(logits_right, -1)
@@ -161,21 +310,21 @@ class RSSM(nn.Module):
 
 
 
-# Stochastic net representing parameterized gaussian distribution - used for reward model and observation model
-class StochasticNet_Gaussian(nn.Module):
+# Observation Decoder Model - parameterized gaussian dist
+class Observation_Decoder(nn.Module):
     def __init__(self, in_dim, h_dim, out_dim):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, h_dim)
         self.fc2 = nn.Linear(h_dim, h_dim)
         self.fc3_mean = nn.Linear(h_dim, out_dim)
         self.fc3_std = nn.Linear(h_dim, out_dim)
-        self.relu = nn.ReLU()
+        self.silu = nn.SiLU()
 
     # forward pass through the stochastic net
     def forward(self, state, belief):
         x = torch.cat((state, belief), dim=-1)
-        h = self.relu(self.fc1(x))
-        h = self.relu(self.fc2(h))
+        h = self.silu(self.fc1(x))
+        h = self.silu(self.fc2(h))
         mean = self.fc3_mean(h)
         # logstd = self.fc3_std(h).clip(minClip, maxClip)
         # std = torch.exp(logstd)
@@ -197,20 +346,20 @@ class StochasticNet_Gaussian(nn.Module):
         return lp
 
 
-# Stochastic net representing parameterized bernoulli distribution - used for discount factor model
-class StochasticNet_Bernoulli(nn.Module):
+# Discount Model - parameterized bernouli dist
+class Discount_Model(nn.Module):
     def __init__(self, in_dim, h_dim, out_dim):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, h_dim)
-        # self.fc2 = nn.Linear(h_dim, h_dim)
+        self.fc2 = nn.Linear(h_dim, h_dim)
         self.fc3 = nn.Linear(h_dim, out_dim)
-        self.relu = nn.ReLU()
+        self.silu = nn.SiLU()
 
     # forward pass through the stochastic net
     def forward(self, state, belief):
         x = torch.cat((state, belief), dim=-1)
-        h = self.relu(self.fc1(x))
-        # h = self.relu(self.fc2(h))
+        h = self.silu(self.fc1(x))
+        h = self.silu(self.fc2(h))
         logits = self.fc3(h)
         return logits
 
@@ -229,10 +378,101 @@ class StochasticNet_Bernoulli(nn.Module):
         dis = tdist.independent.Independent(tdist.Bernoulli(logits=logits), 1)
         lp = dis.log_prob(y)
         return lp
+    
+    # calculate mean - used during imagination rollout
+    def mean(self, state, belief):
+        logits = self.forward(state, belief)
+        dis = tdist.independent.Independent(tdist.Bernoulli(logits=logits), 1)
+        return dis.mean 
+    
+
+# Reward model - parameterized symexp_twohot
+class Reward_Model(nn.Module):
+    def __init__(self, in_dim, h_dim, n_bins):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, h_dim)
+        self.fc2 = nn.Linear(h_dim, h_dim)
+        self.fc3 = nn.Linear(h_dim, n_bins)
+        self.silu = nn.SiLU()
+        self.n_bins = n_bins
+
+        # init last layer weights to zero
+        with torch.no_grad():
+            self.fc3.weight.zero_()
+            self.fc3.bias.zero_()
+
+    # forward pass through the stochastic net
+    def forward(self, state, belief):
+        x = torch.cat((state, belief), dim=-1)
+        h = self.silu(self.fc1(x))
+        h = self.silu(self.fc2(h))
+        logits = self.fc3(h)
+        return logits
+    
+    # prepare symexp_twohot dist
+    def get_dist(self, state, belief):
+        logits = self.forward(state, belief)
+        dis = symexp_twohot(logits, bin_num=self.n_bins)
+        return dis
+
+    # get mode - used during imagination rollout
+    def mode(self, state, belief):
+        dis = self.get_dist(state, belief)
+        mode = dis.mode()
+        return mode
+
+    # calculates log p(y|x)
+    def log_prob(self, state, belief, y):
+        dis = self.get_dist(state, belief)
+        lp = dis.log_prob(y)
+        return lp
 
 
+# Critic model - parameterized symexp_twohot
+class Critic(nn.Module):
+    def __init__(self, s_dim, belief_dim, h_dim, n_bins):
+        super().__init__()
+        self.fc1 = nn.Linear(s_dim + belief_dim, h_dim)
+        self.fc2 = nn.Linear(h_dim, h_dim)
+        self.fc3 = nn.Linear(h_dim, h_dim)
+        self.fc4 = nn.Linear(h_dim, n_bins)
+        self.silu = nn.SiLU()
+        self.n_bins = n_bins
 
-# actor network - parameterizing the stochastic poicy
+        # init last layer weights to zero
+        with torch.no_grad():
+            self.fc4.weight.zero_()
+            self.fc4.bias.zero_()
+
+    def forward(self, state, belief):
+        x = torch.cat((state, belief), dim=-1)
+        h = self.silu(self.fc1(x))
+        h = self.silu(self.fc2(h))
+        h = self.silu(self.fc3(h))
+        val = self.fc4(h)
+        return val
+    
+    # prepare symexp_twohot dist
+    def get_dist(self, state, belief):
+        logits = self.forward(state, belief)
+        dis = symexp_twohot(logits, bin_num=self.n_bins)
+        return dis
+
+    # get mode - used during imagination rollout
+    def mode(self, state, belief):
+        dis = self.get_dist(state, belief)
+        mode = dis.mode()
+        return mode
+
+    # calculates log p(y|x)
+    def log_prob(self, state, belief, y):
+        dis = self.get_dist(state, belief)
+        lp = dis.log_prob(y)
+        return lp
+    
+
+
+# actor network - parameterizing one-hot categorical
 class Actor(nn.Module):
     def __init__(self, s_dim, belief_dim, a_dim, h_dim):
         super().__init__()
@@ -241,22 +481,22 @@ class Actor(nn.Module):
         self.fc3 = nn.Linear(h_dim, h_dim)
         self.fc4 = nn.Linear(h_dim, h_dim)
         self.fc5_logits = nn.Linear(h_dim, a_dim)
-        self.relu = nn.ReLU()
+        self.silu = nn.SiLU()
 
     # returns the logits of one_hot_categorical distribution representing the policy
     def forward(self, state, belief):
         x = torch.cat((state, belief), dim=-1)
-        h = self.relu(self.fc1(x))
-        h = self.relu(self.fc2(h))
-        h = self.relu(self.fc3(h))
-        h = self.relu(self.fc4(h))
+        h = self.silu(self.fc1(x))
+        h = self.silu(self.fc2(h))
+        h = self.silu(self.fc3(h))
+        h = self.silu(self.fc4(h))
         logits = self.fc5_logits(h)
         return logits
 
     # returns the policy as one_hot_categorical distribution
     def policy_dist(self, state, belief):
         logits = self.forward(state, belief)
-        dis = tdist.OneHotCategorical(logits=logits) # TODO: should this be OneHotCategoricalStraightThrough ?
+        dis = OneHotDist(logits=logits, unimix_ratio=0.01) 
         return dis
 
     # returns policy log_prob
@@ -266,24 +506,23 @@ class Actor(nn.Module):
         return lp
 
 
+# used to calculate scale for actor loss
+class ReturnEMA(nn.Module):
 
-# critic network for parameterizing Value function
-class Critic_V(nn.Module):
-    def __init__(self, s_dim, belief_dim, h_dim):
+    def __init__(self, device, alpha=1e-2):
         super().__init__()
-        self.fc1 = nn.Linear(s_dim + belief_dim, h_dim)
-        self.fc2 = nn.Linear(h_dim, h_dim)
-        self.fc3 = nn.Linear(h_dim, h_dim)
-        self.fc4 = nn.Linear(h_dim, 1)
-        self.relu = nn.ReLU()
+        self.device = device
+        self.alpha = alpha
+        self.range = torch.tensor([0.05, 0.95], device=device)
+        self.register_buffer("ema_vals", torch.zeros(2, dtype=torch.float32, device=self.device))
 
-    def forward(self, state, belief):
-        x = torch.cat((state, belief), dim=-1)
-        h = self.relu(self.fc1(x))
-        h = self.relu(self.fc2(h))
-        h = self.relu(self.fc3(h))
-        val = self.fc4(h)
-        return val
+    def __call__(self, x):
+        x_quantile = torch.quantile(torch.flatten(x.detach()), self.range)
+        # Using out-of-place update for torch.compile compatibility
+        self.ema_vals.copy_(self.alpha * x_quantile.detach() + (1 - self.alpha) * self.ema_vals)
+        scale = torch.clip(self.ema_vals[1] - self.ema_vals[0], min=1.0)
+        offset = self.ema_vals[0]
+        return offset.detach(), scale.detach()
 
 
 
@@ -342,21 +581,22 @@ class ReplayBuffer:
 
 # DreamerV2
 class DreamerV2(nn.Module):
-    def __init__(self, o_dim, s_dim, a_dim, belief_dim, h_dim, seq_len, imagination_horizon, df, buf_size, batch_size, lr_actor, lr_critic, lr_model, vib_beta, _lambda, alpha, tau, rho, eta, max_ep_steps, frac, device):
+    def __init__(self, o_dim, s_dim, a_dim, belief_dim, h_dim, seq_len, imagination_horizon, df, buf_size, batch_size, lr_actor, lr_critic, lr_model, _lambda, tau, rho, eta, max_ep_steps, frac, n_bins, device):
         super().__init__()
         self.actor = Actor(s_dim, belief_dim, a_dim, h_dim).to(device)
-        self.critic_V = Critic_V(s_dim, belief_dim, h_dim).to(device)
+        self.critic_V = Critic(s_dim, belief_dim, h_dim, n_bins).to(device)
         self.target_critic_V = deepcopy(self.critic_V)
         self.replay_buffer = ReplayBuffer(buf_size, seq_len, batch_size, o_dim, a_dim, max_ep_steps, frac, device)
         self.rssm = RSSM(s_dim + a_dim, o_dim, belief_dim, h_dim, s_dim, batch_size, device).to(device)
-        self.df_model = StochasticNet_Bernoulli(s_dim + belief_dim, h_dim, 1).to(device)
-        self.reward_model = StochasticNet_Gaussian(s_dim + belief_dim, h_dim, 1).to(device)
-        self.observation_model = StochasticNet_Gaussian(s_dim + belief_dim, h_dim, o_dim).to(device)
-        self.state_model = StochasticNet_Gaussian(o_dim, h_dim, s_dim).to(device)
+        self.df_model = Discount_Model(s_dim + belief_dim, h_dim, 1).to(device)
+        self.reward_model = Reward_Model(s_dim + belief_dim, h_dim, n_bins).to(device)
+        self.observation_model = Observation_Decoder(s_dim + belief_dim, h_dim, o_dim).to(device)
+        self.return_ema = ReturnEMA(device).to(device)
+        # self.state_model = StochasticNet_Gaussian(o_dim, h_dim, s_dim).to(device)
         self.optimizer_actor = torch.optim.Adam(params=self.actor.parameters(), lr=lr_actor)
         self.optimizer_critic_V = torch.optim.Adam(params=self.critic_V.parameters(), lr=lr_critic)
         self.optimizer_model = torch.optim.Adam(params=list(self.rssm.parameters()) + list(self.df_model.parameters()) + \
-        list(self.reward_model.parameters()) + list(self.observation_model.parameters()) + list(self.state_model.parameters()), lr=lr_model)
+        list(self.reward_model.parameters()) + list(self.observation_model.parameters()), lr=lr_model)
         self.df = df
         self.s_dim = s_dim
         self.a_dim = a_dim
@@ -367,9 +607,7 @@ class DreamerV2(nn.Module):
         self.tanh = nn.Tanh()
         self.seq_len = seq_len
         self.imagination_horizon = imagination_horizon
-        self.vib_beta = vib_beta
         self._lambda = _lambda
-        self.alpha = alpha # used for kl balancing
         self.tau = tau # used when updating target_critic_V
         self.rho = rho # used for weighing actor dynamics loss and actor reinforce loss
         self.eta = eta # used for weighing entropy regulaization in actor loss
@@ -377,9 +615,9 @@ class DreamerV2(nn.Module):
 
     def get_action(self, state, belief):
         policy = self.actor.policy_dist(state, belief)
-        action = policy.sample()
-        # for straight through gradient
-        action = action + policy.probs - policy.probs.clone().detach()
+        action = policy.rsample() # gumbel-softmax sample is differentiable
+        # # for straight through gradient
+        # action = action + policy.probs - policy.probs.clone().detach()
         return action, policy
 
     # epsilon greedy exploration
@@ -449,7 +687,7 @@ class DreamerV2(nn.Module):
         self.unfreeze_model_params(self.df_model)
         self.unfreeze_model_params(self.reward_model)
         self.unfreeze_model_params(self.observation_model)
-        self.unfreeze_model_params(self.state_model)
+        # self.unfreeze_model_params(self.state_model)
 
         # using reconstruction loss for now
         # todo - try NCE loss
@@ -466,7 +704,7 @@ class DreamerV2(nn.Module):
         prev_action = torch.zeros(self.batch_size, self.a_dim).to(device)
 
         # rssm rollout 
-        for t in range(observation.shape[0]): 
+        for t in range(observation.shape[0] - 1): # [t : t+H-1] 
 
             # reset if done
             if t > 0:
@@ -486,14 +724,14 @@ class DreamerV2(nn.Module):
             # for next step (no detach)
             prev_state = state_posterior 
             prev_belief = curr_belief
-            prev_action = action[t]
+            prev_action = action[t+1] # since a_t in replay buffer is action taken to reach o_t
 
 
         # rollout ended - stack lists into tensors
-        beliefs = torch.stack(belief_list[:-1], dim=0) # h[t : t+H-1]
-        states = torch.stack(state_posterior_list[:-1], dim=0) # s[t : t+H-1]
-        logits_posterior = torch.stack(logits_posterior_list[:-1], dim=0) 
-        logits_prior = torch.stack(logits_prior_list[:-1], dim=0) 
+        beliefs = torch.stack(belief_list, dim=0) # h[t : t+H-1]
+        states = torch.stack(state_posterior_list, dim=0) # s[t : t+H-1]
+        logits_posterior = torch.stack(logits_posterior_list, dim=0) 
+        logits_prior = torch.stack(logits_prior_list, dim=0) 
 
 
         ## calculate loss terms 
@@ -504,29 +742,22 @@ class DreamerV2(nn.Module):
 
         # observation loss (reconstruction)
         lp_obs = self.observation_model.log_prob(states, beliefs, observation[:-1]) # logp( o[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
-        lp_obs = lp_obs.mean() * obs_loss_scale
+        lp_obs = lp_obs.mean() 
 
         # df loss
         lp_df = self.df_model.log_prob(states, beliefs, (1. - done[:-1])) # logp( d[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
-        lp_df = lp_df.mean() * df_loss_scale
+        lp_df = lp_df.mean() 
             
-        # KL divergence - using KL balancing
-
-        # dist_p = self.rssm.get_dist(logits_posterior)
-        # dist_q = self.rssm.get_dist(logits_prior)
-        # dist_p_detached = self.rssm.get_dist(logits_posterior, detach=True)
-        # dist_q_detached = self.rssm.get_dist(logits_prior, detach=True)
-        # kl_pq = self.alpha * tdist.kl.kl_divergence(dist_p_detached, dist_q) + \
-        #         (1 - self.alpha) * tdist.kl.kl_divergence(dist_p, dist_q_detached)
-
-        kl_p_detached = self.rssm.kl(logits_posterior.detach(), logits_prior).sum(-1) # sum over n_latents. So shape = [horizon, batch]
-        kl_q_detached = self.rssm.kl(logits_posterior, logits_prior.detach()).sum(-1) # sum over n_latents. So shape = [horizon, batch]
-        kl_pq = self.alpha * kl_p_detached + (1 - self.alpha) * kl_q_detached
-
+        # KL divergence - using free nats and weighings
+        kl_dyn = self.rssm.kl(logits_posterior.detach(), logits_prior).sum(-1) # sum over n_latents. So shape = [horizon, batch]
+        kl_rep = self.rssm.kl(logits_posterior, logits_prior.detach()).sum(-1) # sum over n_latents. So shape = [horizon, batch]
+        kl_dyn = torch.clip(kl_dyn, min=1.)
+        kl_rep = torch.clip(kl_rep, min=1.)
+        kl_pq = 0.5 * kl_dyn + 0.1 * kl_rep
         kl_div = kl_pq.mean()
 
         # vib objective
-        vib_objective = lp_reward + lp_obs + lp_df - self.vib_beta * kl_div
+        vib_objective = lp_reward + lp_obs + lp_df - kl_div
 
         # loss
         loss_dynamics = -vib_objective
@@ -535,14 +766,14 @@ class DreamerV2(nn.Module):
         self.optimizer_model.zero_grad()
         loss_dynamics.backward()
         nn.utils.clip_grad_norm_(list(self.rssm.parameters()) + list(self.df_model.parameters()) + list(self.reward_model.parameters()) + \
-                                list(self.observation_model.parameters()) + list(self.state_model.parameters()) , 100., norm_type=2)
+                                list(self.observation_model.parameters()) , 100., norm_type=2)
         self.optimizer_model.step()
 
         # loss accumulators for book keeping and plotting
         loss_reward = -lp_reward
         loss_obs = -lp_obs
         loss_df = -lp_df
-        loss_kl = self.vib_beta * kl_div
+        loss_kl = kl_div
 
 
         ####################
@@ -554,7 +785,6 @@ class DreamerV2(nn.Module):
         self.freeze_model_params(self.df_model)
         self.freeze_model_params(self.reward_model)
         self.freeze_model_params(self.observation_model)
-        self.freeze_model_params(self.state_model)
 
         # list tensors to store 
         im_belief_list = []
@@ -596,12 +826,12 @@ class DreamerV2(nn.Module):
         entropy_pi = torch.stack(entropy_pi_list, dim=0) # entropy[t : t+H]
 
         # calculate rewards, discounts, state_values_target and bootstrap_value for imagined rollout 
-        rewards = self.reward_model.sample(im_states, im_beliefs) # r[t+1 : t+H+1]
-        discounts = self.df * self.df_model.sample(im_states, im_beliefs) # df[t+1 : t+H+1]
-        state_values_target = self.target_critic_V(im_states, im_beliefs).detach()  # v[t+1 : t+H+1]
+        rewards = self.reward_model.mode(im_states, im_beliefs) # r[t+1 : t+H+1]
+        discounts = self.df * self.df_model.mean(im_states, im_beliefs) # df[t+1 : t+H+1]
+        state_values = self.critic_V.mode(im_states, im_beliefs).detach()  # v[t+1 : t+H+1]
 
         # calculate lambda returns 
-        lambda_returns = self.calculate_lambda_return(rewards, discounts, state_values_target) # v_lambda[t+1 : t+H]
+        lambda_returns = self.calculate_lambda_return(rewards, discounts, state_values) # v_lambda[t+1 : t+H]
 
         ## calculate actor loss
 
@@ -614,8 +844,9 @@ class DreamerV2(nn.Module):
         loss_actor_dynamics = loss_actor_dynamics.sum(dim=0).mean() # sum over horizon dim and mean over batch dim
 
         # reinforce loss
-        advantage = (lambda_returns - state_values_target[:-1]).detach() # advantage[t+1 : t+H]
-        loss_actor_reinforce = (-log_pi[1:].unsqueeze(-1) * advantage) * discounts_cumprod 
+        ret_offset, ret_scale = self.return_ema(lambda_returns)
+        advantage = (lambda_returns - state_values[:-1]) / ret_scale # advantage[t+1 : t+H]
+        loss_actor_reinforce = (-log_pi[1:].unsqueeze(-1) * advantage.detach()) * discounts_cumprod 
         loss_actor_reinforce = loss_actor_reinforce.sum(dim=0).mean()
 
         # policy entropy for regularization (and encourage exploration)
@@ -627,13 +858,12 @@ class DreamerV2(nn.Module):
 
         ## calculate critic loss 
 
-        state_values = self.critic_V( im_states.detach(), im_beliefs.detach() )[:-1] # v[t+1 : t+H+1]
-        critic_target = lambda_returns.clone().detach()
-        
-        # loss_critic = F.mse_loss(state_values * torch.pow(discounts_cumprod, 0.5), critic_target * torch.pow(discounts_cumprod, 0.5), reduction='none')
-        loss_critic = discounts_cumprod * 0.5 * ((state_values - critic_target) ** 2)
+        target_values = self.target_critic_V.mode( im_states[:-1], im_beliefs[:-1] ).detach()
 
-        loss_critic = loss_critic.sum(dim=0).mean() # sum over horizon dim and mean over batch dim
+        lp_critic = self.critic_V.log_prob( im_states[:-1].detach(), im_beliefs[:-1].detach(), lambda_returns ) + \
+                      self.critic_V.log_prob( im_states[:-1].detach(), im_beliefs[:-1].detach(), target_values )
+
+        loss_critic = -lp_critic.sum(dim=0).mean() # sum over horizon dim and mean over batch dim
 
         ## update actor and critic
 
@@ -649,40 +879,37 @@ class DreamerV2(nn.Module):
         self.optimizer_actor.step()
         self.optimizer_critic_V.step()        
 
-        return loss_dynamics, loss_reward, loss_obs, loss_df, loss_kl, loss_actor, loss_critic
+        return loss_dynamics, loss_reward, loss_obs, loss_df, loss_kl, loss_actor, loss_critic, policy_entropy, ret_scale
 
 
 # main
 if __name__ == '__main__':
 
     # hyperparams
+    n_bins = 255
     h_dim = 256 # 200
-    n_latents = 4 # 32 # 20
-    n_classes = 8 # 32 # 20
+    n_latents = 16 # 4
+    n_classes = 32 # 8
     s_dim = n_latents * n_classes 
-    belief_dim = 32 # 200
+    belief_dim = 512 # 32
     lr_actor = 4e-5 # 4e-5
     lr_critic = 1e-4 # 1e-4
     lr_model = 2e-4 # 2e-4
     sample_seq_len = 64 # 50 # length of contiguous sequence sampled from replay buffer (when training)
     imagination_horizon = 16 # 15 # length of imagined rollouts using the learnt dynamics model (when behaviour learning)
-    vib_beta = 1 # 0.1 # beta - tradeoff hyperparam in vib objective
     _lambda = .95 # lambda - used to calculate lambda return
-    alpha = .8 # used for kl balancing
-    tau = 1e-2 # used when updating target_critic_V
+    tau = 0.02 # used when updating target_critic_V
     target_critic_update_step = 1
-    rho = 0.75 # 0.25 # 0 # 1 # used for weighing actor dynamics loss and actor reinforce loss
-    eta = 1e-3 # used for weighing entropy regulaization in actor loss
-    df = 0.995
-    df_loss_scale = 1 # 5
-    obs_loss_scale = 1 # 1e-1
-    frac = 0.25 # 0 # 0.5 # 0.9 # 0.75 # 0.1
+    rho = 1 # used for weighing actor dynamics loss and actor reinforce loss
+    eta = 3e-4 # used for weighing entropy regulaization in actor loss
+    df = 0.997
+    frac = 0 # 0.1 # 0.25
     STD = 1
     minClip, maxClip = -2, 2
     random_seed = 1010
-    batch_size = 256 # 64 # 512
+    batch_size = 64 # 256
     replay_buffer_size = 10**6 # 4 # 3
-    num_episodes = 200 # 400
+    num_episodes = 400 # 200 # 100
     init_random_episodes = 5
     num_train_calls = 10 # 50 # 1  
     train_episode = 1
@@ -701,7 +928,7 @@ if __name__ == '__main__':
     # hyperparam dict
     hyperparam_dict = {}
     hyperparam_dict['env'] = 'CartPole-v1'
-    hyperparam_dict['algo'] = 'dreamerV2_6_10_guhare_sheepFix_dynIdxFix_dfCumprodFix_otherKLLoss'
+    hyperparam_dict['algo'] = 'dreamerV3_r2_actorUnimix_trainActionFix_rssmNorms'
     hyperparam_dict['Sdim'] = str(s_dim)
     hyperparam_dict['Bdim'] = str(belief_dim)
     # hyperparam_dict['Hdim'] = str(h_dim)
@@ -711,13 +938,10 @@ if __name__ == '__main__':
     # hyperparam_dict['_lambda'] = str(_lambda)
     # hyperparam_dict['L'] = str(sample_seq_len)
     # hyperparam_dict['H'] = str(imagination_horizon)
-    hyperparam_dict['beta'] = str(vib_beta)
     hyperparam_dict['rho'] = str(rho)
     # hyperparam_dict['eta'] = str(eta)
     hyperparam_dict['tau'] = str(tau)
     # hyperparam_dict['df'] = str(df)
-    # hyperparam_dict['dfScale'] = str(df_loss_scale)
-    # hyperparam_dict['obsScale'] = str(obs_loss_scale)
     hyperparam_dict['B'] = str(batch_size)
     hyperparam_dict['EP'] = str(num_episodes)
     hyperparam_dict['trCalls'] = str(num_train_calls)
@@ -747,7 +971,7 @@ if __name__ == '__main__':
     env.action_space.seed(random_seed)
 
     # init Dreamer agent
-    agent = DreamerV2(o_dim, s_dim, a_dim, belief_dim, h_dim, sample_seq_len, imagination_horizon, df, replay_buffer_size, batch_size, lr_actor, lr_critic, lr_model, vib_beta, _lambda, alpha, tau, rho, eta, max_ep_steps, frac, device)
+    agent = DreamerV2(o_dim, s_dim, a_dim, belief_dim, h_dim, sample_seq_len, imagination_horizon, df, replay_buffer_size, batch_size, lr_actor, lr_critic, lr_model, _lambda, tau, rho, eta, max_ep_steps, frac, n_bins, device)
 
     # results and stats containers
     ep_return_list = []
@@ -758,6 +982,8 @@ if __name__ == '__main__':
     loss_kl_list = []
     loss_actor_list = []
     loss_critic_list = []
+    policy_entropy_list = []
+    ret_scale_list = []
     unique_states_visited = set()
     n_states_list = []
 
@@ -871,7 +1097,7 @@ if __name__ == '__main__':
         if ep % train_episode == 0:
             for _ in range(num_train_calls):
 
-                l_dyn, l_rew, l_obs, l_df, l_kl, l_act, l_cri = agent.train()
+                l_dyn, l_rew, l_obs, l_df, l_kl, l_act, l_cri, p_entr, ret_scale = agent.train()
                 loss_dynamics_list.append(l_dyn.item())
                 loss_reward_list.append(l_rew.item())
                 loss_obs_list.append(l_obs.item())
@@ -879,6 +1105,8 @@ if __name__ == '__main__':
                 loss_kl_list.append(l_kl.item())
                 loss_actor_list.append(l_act.item())
                 loss_critic_list.append(l_cri.item())
+                policy_entropy_list.append(p_entr.item())
+                ret_scale_list.append(ret_scale.item())
 
                 total_gradient_steps += 1
                 if total_gradient_steps % target_critic_update_step == 0:
@@ -922,10 +1150,10 @@ loss_df_moving_mean = get_moving_mean_list(loss_df_list)
 loss_kl_moving_mean = get_moving_mean_list(loss_kl_list)
 loss_actor_moving_mean = get_moving_mean_list(loss_actor_list)
 loss_critic_moving_mean = get_moving_mean_list(loss_critic_list)
-
+policy_entropy_moving_mean = get_moving_mean_list(policy_entropy_list)
 
 # plot results
-fig, ax = plt.subplots(2,3, figsize=(15,10))
+fig, ax = plt.subplots(2,4, figsize=(20,10))
 
 ax[0,0].plot(ep_returns_moving_mean, color='green', label='ep_return')
 ax[0,0].legend()
@@ -963,19 +1191,23 @@ ax[0,2].set_title('df_loss:{:.3f} kl_loss:{:.3f}'.format(loss_df_moving_mean[-1]
 ax[0,2].set(xlabel='steps')
 ax[0,2].grid()
 
-# ax[1,2].plot(loss_dynamics_moving_mean, color='red', label='dynamics_loss')
-# ax[1,2].plot(loss_reward_moving_mean, color='lime', label='reward_loss')
-# ax[1,2].plot(loss_obs_moving_mean, color='blue', label='obs_loss')
-# ax[1,2].legend()
-# ax[1,2].set_title('rew_loss:{:.3f} obs_loss:{:.3f}'.format(loss_reward_moving_mean[-1], loss_obs_moving_mean[-1]))
-# ax[1,2].set(xlabel='steps')
-# ax[1,2].grid()
-# # ax[1,2].set_ylim([-500,500])
+ax[0,3].plot(loss_reward_moving_mean, color='green', label='rew_loss')
+ax[0,3].legend()
+ax[0,3].set_title('rew_loss:{:.3f}'.format(loss_reward_moving_mean[-1]))
+ax[0,3].set(xlabel='steps')
+ax[0,3].grid()
 
 ax[1,2].plot(n_states_list, color='red', label='unique_states')
 ax[1,2].legend()
 ax[1,2].set_title(f'unique_states:{n_states_list[-1]}') 
 ax[1,2].set(xlabel='steps')
 ax[1,2].grid()
+
+ax[1,3].plot(policy_entropy_moving_mean, color='blue', label='policy_entropy')
+ax[1,3].plot(ret_scale_list, color='green', label='ret_scale')
+ax[1,3].legend()
+ax[1,3].set_title('policy_entropy:{:.3f} ret_scale:{:2f}'.format(policy_entropy_moving_mean[-1], ret_scale_list[-1]))
+ax[1,3].set(xlabel='steps')
+ax[1,3].grid()
 
 plt.savefig('plots/' + hyperstr + '.png')

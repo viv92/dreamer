@@ -142,6 +142,22 @@ class RSSM(nn.Module):
         logits = logits.reshape(logits.shape[0], n_latents, n_classes)
         dis = tdist.Independent(tdist.OneHotCategoricalStraightThrough(logits=logits), 1)
         return dis
+    
+    # function to calculate KL divergence
+    def kl(self, logits_left, logits_right):
+
+        def reshape_logits(logits):
+            batch_shape = logits.shape[:-1]
+            logits = logits.reshape(*batch_shape, n_latents, n_classes)
+            return logits 
+
+        logits_left = reshape_logits(logits_left)
+        logits_right = reshape_logits(logits_right)
+        # (..., K), (..., K)
+        logprob_left = torch.log_softmax(logits_left, -1)
+        logprob_right = torch.log_softmax(logits_right, -1)
+        prob = torch.softmax(logits_left, -1)
+        return (prob * (logprob_left - logprob_right)).sum(-1)  # sum over n_classes. So out.shape = [horizon, batch, n_latents]
 
 
 
@@ -483,7 +499,7 @@ class DreamerV2(nn.Module):
         ## calculate loss terms 
 
         # reward loss
-        lp_reward = self.reward_model.log_prob(states, beliefs, reward[1:]) # logp( r[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
+        lp_reward = self.reward_model.log_prob(states, beliefs, reward[:-1]) # logp( r[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
         lp_reward = lp_reward.mean()
 
         # observation loss (reconstruction)
@@ -491,16 +507,22 @@ class DreamerV2(nn.Module):
         lp_obs = lp_obs.mean() * obs_loss_scale
 
         # df loss
-        lp_df = self.df_model.log_prob(states, beliefs, (1. - done[1:])) # logp( d[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
+        lp_df = self.df_model.log_prob(states, beliefs, (1. - done[:-1])) # logp( d[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
         lp_df = lp_df.mean() * df_loss_scale
             
         # KL divergence - using KL balancing
-        dist_p = self.rssm.get_dist(logits_posterior)
-        dist_q = self.rssm.get_dist(logits_prior)
-        dist_p_detached = self.rssm.get_dist(logits_posterior, detach=True)
-        dist_q_detached = self.rssm.get_dist(logits_prior, detach=True)
-        kl_pq = self.alpha * tdist.kl.kl_divergence(dist_p_detached, dist_q) + \
-                (1 - self.alpha) * tdist.kl.kl_divergence(dist_p, dist_q_detached)
+
+        # dist_p = self.rssm.get_dist(logits_posterior)
+        # dist_q = self.rssm.get_dist(logits_prior)
+        # dist_p_detached = self.rssm.get_dist(logits_posterior, detach=True)
+        # dist_q_detached = self.rssm.get_dist(logits_prior, detach=True)
+        # kl_pq = self.alpha * tdist.kl.kl_divergence(dist_p_detached, dist_q) + \
+        #         (1 - self.alpha) * tdist.kl.kl_divergence(dist_p, dist_q_detached)
+
+        kl_p_detached = self.rssm.kl(logits_posterior.detach(), logits_prior).sum(-1) # sum over n_latents. So shape = [horizon, batch]
+        kl_q_detached = self.rssm.kl(logits_posterior, logits_prior.detach()).sum(-1) # sum over n_latents. So shape = [horizon, batch]
+        kl_pq = self.alpha * kl_p_detached + (1 - self.alpha) * kl_q_detached
+
         kl_div = kl_pq.mean()
 
         # vib objective
@@ -584,8 +606,8 @@ class DreamerV2(nn.Module):
         ## calculate actor loss
 
         # create discount cumprods
-        discounts_overwriteFirst = torch.cat((torch.ones_like(discounts[:1]), discounts[1:]), dim=0) # [df[t+1] = 1] + df[t+2 : t+H+1]
-        discounts_cumprod = torch.cumprod(discounts_overwriteFirst[:-1], dim=0).detach() # df[t+1 : t+H]
+        # discounts_overwriteFirst = torch.cat((torch.ones_like(discounts[:1]), discounts[1:]), dim=0) # [df[t+1] = 1] + df[t+2 : t+H+1]
+        discounts_cumprod = torch.cumprod(discounts[:-1], dim=0).detach() # df[t+1 : t+H]
 
         # loss through dynamics 
         loss_actor_dynamics = -lambda_returns * discounts_cumprod
@@ -636,16 +658,16 @@ if __name__ == '__main__':
 
     # hyperparams
     h_dim = 256 # 200
-    n_latents = 32 # 20
+    n_latents = 16 # 32 # 20
     n_classes = 32 # 20
     s_dim = n_latents * n_classes 
-    belief_dim = 200 # 64
+    belief_dim = 512 # 200 # 64
     lr_actor = 4e-5 # 4e-5
     lr_critic = 1e-4 # 1e-4
     lr_model = 2e-4 # 2e-4
     sample_seq_len = 64 # 50 # length of contiguous sequence sampled from replay buffer (when training)
     imagination_horizon = 16 # 15 # length of imagined rollouts using the learnt dynamics model (when behaviour learning)
-    vib_beta = 1 # 0.1 # beta - tradeoff hyperparam in vib objective
+    vib_beta = 0.1 # 1 # beta - tradeoff hyperparam in vib objective
     _lambda = .95 # lambda - used to calculate lambda return
     alpha = .8 # used for kl balancing
     tau = 1e-2 # used when updating target_critic_V
@@ -661,7 +683,7 @@ if __name__ == '__main__':
     random_seed = 1010
     batch_size = 256 # 64 # 512
     replay_buffer_size = 10**6 # 4 # 3
-    num_episodes = 600 # 200 # 400
+    num_episodes = 400 # 100
     init_random_episodes = 5
     num_train_calls = 10 # 50 # 1  
     train_episode = 1
@@ -680,7 +702,7 @@ if __name__ == '__main__':
     # hyperparam dict
     hyperparam_dict = {}
     hyperparam_dict['env'] = 'LunarLander-v3'
-    hyperparam_dict['algo'] = 'dreamerV2_6_10_guhare_sheepFix'
+    hyperparam_dict['algo'] = 'dreamerV2_6_10_guhare_sheepFix_dynIdxFix_dfCumprodFix_otherKLLoss'
     hyperparam_dict['Sdim'] = str(s_dim)
     hyperparam_dict['Bdim'] = str(belief_dim)
     # hyperparam_dict['Hdim'] = str(h_dim)
@@ -705,7 +727,7 @@ if __name__ == '__main__':
     # hyperparam_dict['VTupdateSt'] = str(target_critic_update_step)
     # hyperparam_dict['maxSt'] = str(max_time_steps)
     # hyperparam_dict['random_seed'] = str(random_seed)
-    hyperparam_dict['actionRep'] = str(action_repeat)
+    # hyperparam_dict['actionRep'] = str(action_repeat)
     hyperparam_dict['buffSz'] = str(replay_buffer_size)
     # hyperparam_dict['xploreMin'] = str(explore_minLimit)
     # hyperparam_dict['xploreMax'] = str(explore_maxLimit)
@@ -769,7 +791,7 @@ if __name__ == '__main__':
 
     # epsilon schedule
     epsilon_schedule = np.ones(num_episodes) * explore_minLimit
-    epsilon_schedule[:int(400 * 0.8)] = np.linspace(explore_maxLimit, explore_minLimit, int(400 * 0.8))
+    epsilon_schedule[:int(num_episodes * 0.8)] = np.linspace(explore_maxLimit, explore_minLimit, int(num_episodes * 0.8))
 
 
     # interactive episodes

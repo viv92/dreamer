@@ -142,6 +142,22 @@ class RSSM(nn.Module):
         logits = logits.reshape(logits.shape[0], n_latents, n_classes)
         dis = tdist.Independent(tdist.OneHotCategoricalStraightThrough(logits=logits), 1)
         return dis
+    
+    # function to calculate KL divergence
+    def kl(self, logits_left, logits_right):
+
+        def reshape_logits(logits):
+            batch_shape = logits.shape[:-1]
+            logits = logits.reshape(*batch_shape, n_latents, n_classes)
+            return logits 
+
+        logits_left = reshape_logits(logits_left)
+        logits_right = reshape_logits(logits_right)
+        # (..., K), (..., K)
+        logprob_left = torch.log_softmax(logits_left, -1)
+        logprob_right = torch.log_softmax(logits_right, -1)
+        prob = torch.softmax(logits_left, -1)
+        return (prob * (logprob_left - logprob_right)).sum(-1)  # sum over n_classes. So out.shape = [horizon, batch, n_latents]
 
 
 
@@ -483,7 +499,7 @@ class DreamerV2(nn.Module):
         ## calculate loss terms 
 
         # reward loss
-        lp_reward = self.reward_model.log_prob(states, beliefs, reward[1:]) # logp( r[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
+        lp_reward = self.reward_model.log_prob(states, beliefs, reward[:-1]) # logp( r[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
         lp_reward = lp_reward.mean()
 
         # observation loss (reconstruction)
@@ -491,16 +507,22 @@ class DreamerV2(nn.Module):
         lp_obs = lp_obs.mean() * obs_loss_scale
 
         # df loss
-        lp_df = self.df_model.log_prob(states, beliefs, (1. - done[1:])) # logp( d[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
+        lp_df = self.df_model.log_prob(states, beliefs, (1. - done[:-1])) # logp( d[t:t+H-1] | s[t:t+H-1], h[t:t+H-1] )
         lp_df = lp_df.mean() * df_loss_scale
             
         # KL divergence - using KL balancing
-        dist_p = self.rssm.get_dist(logits_posterior)
-        dist_q = self.rssm.get_dist(logits_prior)
-        dist_p_detached = self.rssm.get_dist(logits_posterior, detach=True)
-        dist_q_detached = self.rssm.get_dist(logits_prior, detach=True)
-        kl_pq = self.alpha * tdist.kl.kl_divergence(dist_p_detached, dist_q) + \
-                (1 - self.alpha) * tdist.kl.kl_divergence(dist_p, dist_q_detached)
+
+        # dist_p = self.rssm.get_dist(logits_posterior)
+        # dist_q = self.rssm.get_dist(logits_prior)
+        # dist_p_detached = self.rssm.get_dist(logits_posterior, detach=True)
+        # dist_q_detached = self.rssm.get_dist(logits_prior, detach=True)
+        # kl_pq = self.alpha * tdist.kl.kl_divergence(dist_p_detached, dist_q) + \
+        #         (1 - self.alpha) * tdist.kl.kl_divergence(dist_p, dist_q_detached)
+
+        kl_p_detached = self.rssm.kl(logits_posterior.detach(), logits_prior).sum(-1) # sum over n_latents. So shape = [horizon, batch]
+        kl_q_detached = self.rssm.kl(logits_posterior, logits_prior.detach()).sum(-1) # sum over n_latents. So shape = [horizon, batch]
+        kl_pq = self.alpha * kl_p_detached + (1 - self.alpha) * kl_q_detached
+
         kl_div = kl_pq.mean()
 
         # vib objective
@@ -582,8 +604,8 @@ class DreamerV2(nn.Module):
         lambda_returns = self.calculate_lambda_return(rewards, discounts, state_values_target) # v_lambda[t+1 : t+H]
 
         # create discount cumprods
-        discounts_overwriteFirst = torch.cat((torch.ones_like(discounts[:1]), discounts[1:]), dim=0) # [df[t+1] = 1] + df[t+2 : t+H+1]
-        discounts_cumprod = torch.cumprod(discounts_overwriteFirst[:-1], dim=0).detach() # df[t+1 : t+H]
+        # discounts_overwriteFirst = torch.cat((torch.ones_like(discounts[:1]), discounts[1:]), dim=0) # [df[t+1] = 1] + df[t+2 : t+H+1]
+        discounts_cumprod = torch.cumprod(discounts[:-1], dim=0).detach() # df[t+1 : t+H]
 
         ## calculate critic loss 
 
@@ -633,10 +655,10 @@ if __name__ == '__main__':
 
     # hyperparams
     h_dim = 256 # 200
-    n_latents = 32 # 20
+    n_latents = 16 # 32 # 20
     n_classes = 32 # 20
     s_dim = n_latents * n_classes 
-    belief_dim = 200 # 128
+    belief_dim = 512 # 200 # 128
     lr_actor = 4e-5 # 4e-5
     lr_critic = 1e-4 # 1e-4
     lr_model = 2e-4 # 2e-4
@@ -661,7 +683,7 @@ if __name__ == '__main__':
     random_seed = 1010
     batch_size = 64 # 256 # 512
     replay_buffer_size = 10**3 # 4
-    num_episodes = 200 # 400 
+    num_episodes = 100 # 200 # 400 
     # init_random_episodes = 0 # 5
     num_train_calls = 30 # 10 # 100 # 1 # 50  
     train_episode = 1
@@ -682,7 +704,7 @@ if __name__ == '__main__':
     # hyperparam dict
     hyperparam_dict = {}
     hyperparam_dict['env'] = 'MountainCar-v0'
-    hyperparam_dict['algo'] = 'dreamerV2_guhare_sheepFix_ICMdream_reinforceV'
+    hyperparam_dict['algo'] = 'dreamerV2_r2_ICMdream_reinforceV'
     hyperparam_dict['Sdim'] = str(s_dim)
     # hyperparam_dict['Bdim'] = str(belief_dim)
     # hyperparam_dict['Hdim'] = str(h_dim)
@@ -833,9 +855,13 @@ if __name__ == '__main__':
             # calculate intrinsic reward - ICM dream
             reward_intrinsic = 0
             if ep > delay_ep:
-                dist_p_detached = agent.rssm.get_dist(logits_posterior, detach=True)
-                dist_q_detached = agent.rssm.get_dist(logits_prior, detach=True)
-                kl_pq = tdist.kl.kl_divergence(dist_p_detached, dist_q_detached) 
+
+                # dist_p_detached = agent.rssm.get_dist(logits_posterior, detach=True)
+                # dist_q_detached = agent.rssm.get_dist(logits_prior, detach=True)
+                # kl_pq = tdist.kl.kl_divergence(dist_p_detached, dist_q_detached) 
+
+                kl_pq = agent.rssm.kl(logits_posterior.detach(), logits_prior.detach()).sum(-1)
+
                 reward_intrinsic = kl_pq.mean().item() * reward_intrinsic_scale
 
             reward = reward_extrinsic + reward_intrinsic
